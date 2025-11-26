@@ -804,11 +804,7 @@ void MipsGenerator::processInstruction(const std::string& line) {
         }
         else if (op == "call") {
             // %3 = call i32 @func(...)
-            // Flush registers before call!
-            flushRegisters();
-
             // 解析函数名和参数
-            // 简化：假设没有参数，或参数已经在 parseFuncDef 中处理了
             std::string ret_type, func_name;
             ss >> ret_type >> func_name;
             size_t p = func_name.find('(');
@@ -816,24 +812,37 @@ void MipsGenerator::processInstruction(const std::string& line) {
             std::string args_str = line.substr(line.find('(')+1);
             args_str.pop_back(); // 去掉 )
 
-            // 逗号分割
+            // * 修复：先收集所有参数值到临时寄存器数组，避免参数计算时互相干扰
+            std::vector<std::string> arg_values;  // 保存参数值（变量名或立即数）
             std::stringstream arg_ss(args_str);
             std::string segment;
-            int arg_idx = 0;
             while(std::getline(arg_ss, segment, ',')) {
-                // segment: "i32 %10"
                 std::stringstream seg_ss(segment);
                 std::string type, val;
                 seg_ss >> type >> val;
-
-                // 加载参数到寄存器
-                int r = getReg(val, false);
-                if (arg_idx < 4) {
-                    emit("move $a" + std::to_string(arg_idx) + ", " + getRegName(r));
-                } else {
-                    // 超过4个参数压栈，这里略
+                if (!val.empty()) {
+                    arg_values.push_back(val);
                 }
-                arg_idx++;
+            }
+
+            // * 先计算所有参数值并保存到栈上的临时位置
+            // 使用固定的临时栈区域来保存参数（避免寄存器分配时的干扰）
+            std::vector<int> arg_stack_offsets;
+            int temp_arg_base = current_stack_offset - 100;  // 使用栈的一个固定区域
+            for (int i = 0; i < (int)arg_values.size() && i < 4; ++i) {
+                int r = getReg(arg_values[i], false);
+                int offset = temp_arg_base - i * 4;
+                emitStoreWord(getRegName(r), offset, "$fp");
+                arg_stack_offsets.push_back(offset);
+            }
+
+            // Flush registers before call!
+            flushRegisters();
+
+            // * 从临时栈位置加载参数到 $a0-$a3
+            for (int i = 0; i < (int)arg_stack_offsets.size() && i < 4; ++i) {
+                std::string arg_reg = "$a" + std::to_string(i);
+                emitLoadWord(arg_reg, arg_stack_offsets[i], "$fp");
             }
 
             if (real_name == "getint") {
@@ -952,8 +961,6 @@ void MipsGenerator::processInstruction(const std::string& line) {
     // 6. Void call 指令 (没有返回值的函数调用)
     else if (token == "call") {
         // call void @putint(i32 %3)
-        flushRegisters();
-
         std::string ret_type, func_name;
         ss >> ret_type >> func_name;
         size_t p = func_name.find('(');
@@ -961,21 +968,36 @@ void MipsGenerator::processInstruction(const std::string& line) {
         std::string args_str = line.substr(line.find('(')+1);
         if (!args_str.empty() && args_str.back() == ')') args_str.pop_back();
 
-        // 解析参数
+        // * 修复：先收集所有参数值，避免参数计算时互相干扰
+        std::vector<std::string> arg_values;
         std::stringstream arg_ss(args_str);
         std::string segment;
-        int arg_idx = 0;
         while(std::getline(arg_ss, segment, ',')) {
             std::stringstream seg_ss(segment);
             std::string type, val;
             seg_ss >> type >> val;
-            if (val.empty()) continue;
-
-            int r = getReg(val, false);
-            if (arg_idx < 4) {
-                emit("move $a" + std::to_string(arg_idx) + ", " + getRegName(r));
+            if (!val.empty()) {
+                arg_values.push_back(val);
             }
-            arg_idx++;
+        }
+
+        // * 先计算所有参数值并保存到栈上的临时位置
+        std::vector<int> arg_stack_offsets;
+        int temp_arg_base = current_stack_offset - 100;
+        for (int i = 0; i < (int)arg_values.size() && i < 4; ++i) {
+            int r = getReg(arg_values[i], false);
+            int offset = temp_arg_base - i * 4;
+            emitStoreWord(getRegName(r), offset, "$fp");
+            arg_stack_offsets.push_back(offset);
+        }
+
+        // Flush registers before call!
+        flushRegisters();
+
+        // * 从临时栈位置加载参数到 $a0-$a3
+        for (int i = 0; i < (int)arg_stack_offsets.size() && i < 4; ++i) {
+            std::string arg_reg = "$a" + std::to_string(i);
+            emitLoadWord(arg_reg, arg_stack_offsets[i], "$fp");
         }
 
         if (real_name == "putint") {
