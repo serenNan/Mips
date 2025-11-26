@@ -82,7 +82,8 @@ int MipsGenerator::spillReg() {
 
     // 执行溢出操作
     std::string var = regs[victim].name;
-    if (regs[victim].dirty) {
+    // * alloca 变量不需要溢出（它的值是地址，是常量）
+    if (regs[victim].dirty && !(is_alloca_var.count(var) && is_alloca_var[var])) {
         int offset = getStackOffset(var);
         emit("sw " + getRegName(victim) + ", " + std::to_string(offset) + "($fp) # Spill " + var);
     }
@@ -146,15 +147,26 @@ int MipsGenerator::getReg(const std::string& var_name, bool is_def, bool is_addr
     // 5. 如果是读操作（不是定义），则从栈加载旧值
     if (!is_def) {
         if (var_name[0] == '@') {
-            // 【修正：处理全局变量/常量 (@)】
-            // 1. Load Address: r = LA @global_name
-            std::string global_label = var_name.substr(1);
-            emit("la " + getRegName(reg) + ", " + global_label + " # Load Global Address of " + var_name);
-            // 2. Load Value: r = LW 0(r)
-            emit("lw " + getRegName(reg) + ", 0(" + getRegName(reg) + ") # Load Global Value " + var_name);
+            // 【处理全局变量/常量 (@)】
+            std::string raw_label = var_name.substr(1);
+            // 字符串常量以 .str 开头不需要前缀，其他全局变量需要 _ 前缀
+            std::string global_label = (raw_label[0] == '.') ? raw_label : ("_" + raw_label);
+            if (is_addr) {
+                // 只取地址（用于 load/store 指令的指针操作数）
+                emit("la " + getRegName(reg) + ", " + global_label + " # Load Global Address of " + var_name);
+            } else {
+                // 取值（用于普通表达式）
+                emit("la " + getRegName(reg) + ", " + global_label + " # Load Global Address of " + var_name);
+                emit("lw " + getRegName(reg) + ", 0(" + getRegName(reg) + ") # Load Global Value " + var_name);
+            }
+            regs[reg].dirty = false;
+        } else if (is_alloca_var.count(var_name) && is_alloca_var[var_name]) {
+            // * alloca 变量：其值是地址，计算 $fp + offset
+            int offset = getStackOffset(var_name);
+            emit("addiu " + getRegName(reg) + ", $fp, " + std::to_string(offset) + " # Address of " + var_name);
             regs[reg].dirty = false;
         } else {
-            // 局部变量/临时变量 (% 或其他): 从栈加载值
+            // 普通局部变量/临时变量: 从栈加载值
             int offset = getStackOffset(var_name);
             emit("lw " + getRegName(reg) + ", " + std::to_string(offset) + "($fp) # Load " + var_name);
             regs[reg].dirty = false;
@@ -169,7 +181,9 @@ int MipsGenerator::getReg(const std::string& var_name, bool is_def, bool is_addr
 void MipsGenerator::flushRegisters() {
     for (int i = 0; i < 10; ++i) {
         if (regs[i].busy) {
-            if (regs[i].dirty && !regs[i].name.empty()) {
+            // * alloca 变量不需要写回（它的值是地址，是常量）
+            if (regs[i].dirty && !regs[i].name.empty() &&
+                !(is_alloca_var.count(regs[i].name) && is_alloca_var[regs[i].name])) {
                 int offset = getStackOffset(regs[i].name);
                 emit("sw " + getRegName(i) + ", " + std::to_string(offset) + "($fp) # Flush " + regs[i].name);
             }
@@ -199,27 +213,77 @@ void MipsGenerator::generate() {
 }
 
 void MipsGenerator::parseGlobalVars() {
-    // 复用之前的逻辑，这里为了节省篇幅简写，重点是 .data 段的生成
-    // 请将上一版代码中的 parseGlobalVars 完整复制过来
+    // 解析全局变量和常量数组
     std::string line;
     while (std::getline(llvm_file, line)) {
-        if (line.find("@") == 0 && line.find("global") != std::string::npos) {
+        // * 处理全局变量: @name = global i32 0, align 4
+        // 注意：排除字符串常量（@.str 开头）
+        if (line.find("@") == 0 && line.find("@.str") == std::string::npos && line.find("= global") != std::string::npos) {
             std::stringstream ss(line);
             std::string name_token;
             ss >> name_token;
             std::string name = name_token.substr(1);
-            mips_file << name << ": ";
+            // 添加下划线前缀，避免与 MIPS 指令名（如 b, j）冲突
+            mips_file << "_" << name << ": ";
 
             if (line.find("zeroinitializer") != std::string::npos) {
-                // 简化处理：假设数组大小在 line 里
-                // 实际应解析 [N x i32]
-                mips_file << ".word 0:1024 \n"; // 暴力分配，或者按实际大小
+                // 数组零初始化，解析 [N x i32]
+                size_t bracket_start = line.find('[');
+                size_t x_pos = line.find('x');
+                if (bracket_start != std::string::npos && x_pos != std::string::npos) {
+                    int num = std::stoi(line.substr(bracket_start + 1, x_pos - bracket_start - 1));
+                    mips_file << ".word 0:" << num << "\n";
+                } else {
+                    mips_file << ".word 0\n";
+                }
             } else {
-                // 简化处理显式初始化
-                // 这里需要根据你的具体实现完善，简单起见输出 .word 0
+                // 简单标量初始化
                 mips_file << ".word 0\n";
             }
         }
+        // * 处理常量数组: @ia1_9 = constant [5 x i32] [i32 1, i32 2, ...], align 4
+        // ! 注意：不能以 @.str 开头（那是字符串常量）
+        else if (line.find("@") == 0 && line.find("@.str") == std::string::npos && line.find("constant") != std::string::npos && line.find("x i32]") != std::string::npos) {
+            std::stringstream ss(line);
+            std::string name_token;
+            ss >> name_token;
+            std::string name = name_token.substr(1);
+            // 添加下划线前缀，避免与 MIPS 指令名冲突
+            mips_file << "_" << name << ": .word ";
+
+            // 提取数组初始化值 [i32 1, i32 2, i32 3, ...]
+            size_t init_start = line.find("] [");
+            if (init_start != std::string::npos) {
+                init_start += 3; // 跳过 "] ["
+                size_t init_end = line.find("]", init_start);
+                std::string init_list = line.substr(init_start, init_end - init_start);
+
+                // 解析 i32 N, i32 M, ...
+                std::vector<int> values;
+                std::stringstream init_ss(init_list);
+                std::string token;
+                while (std::getline(init_ss, token, ',')) {
+                    size_t i32_pos = token.find("i32");
+                    if (i32_pos != std::string::npos) {
+                        std::string num_str = token.substr(i32_pos + 3);
+                        // 去除空格
+                        num_str.erase(0, num_str.find_first_not_of(" \t"));
+                        num_str.erase(num_str.find_last_not_of(" \t") + 1);
+                        if (!num_str.empty()) {
+                            values.push_back(std::stoi(num_str));
+                        }
+                    }
+                }
+
+                // 输出数组值 (SPIM 用空格分隔，不是逗号)
+                for (size_t i = 0; i < values.size(); ++i) {
+                    if (i > 0) mips_file << " ";
+                    mips_file << values[i];
+                }
+                mips_file << "\n";
+            }
+        }
+        // * 处理字符串常量: @.str = private unnamed_addr constant [6 x i8] c"crsb\0A\00", align 1
         else if (line.find("@.str") != std::string::npos && line.find("constant") != std::string::npos) {
             // 字符串常量处理：@.str = private unnamed_addr constant [6 x i8] c"crsb\0A\00", align 1
             std::stringstream ss(line);
@@ -279,22 +343,57 @@ void MipsGenerator::parseFunctions() {
             in_function = true;
             flushRegisters(); // 安全起见
             stack_map.clear();
+            is_alloca_var.clear(); // 清空 alloca 标记
             current_stack_offset = 0;
 
-            std::string ret, name_args;
-            ss >> ret >> name_args;
-            std::string func_name = name_args.substr(1, name_args.find('(')-1);
+            // 从完整的 line 解析函数定义
+            // 格式: define i32 @func2(i32 %arg1, i32 %arg2) {
+            size_t at_pos = line.find('@');
+            size_t paren_start = line.find('(');
+            size_t paren_end = line.find(')');
+
+            std::string func_name = line.substr(at_pos + 1, paren_start - at_pos - 1);
 
             mips_file << "\n" << func_name << ":\n";
             // Prologue
-            emit("sw $fp, -4($sp)");
-            emit("sw $ra, -8($sp)");
-            emit("move $fp, $sp");
-            emit("subu $sp, $sp, 2048"); // 栈帧
+            // 栈布局: $sp(原) -> [$fp saved], [$ra saved], [locals...]
+            // 先减 $sp 为保存区腾出空间
+            emit("subu $sp, $sp, 8");     // 为 $fp 和 $ra 预留空间
+            emit("sw $fp, 4($sp)");       // 保存旧 $fp 在 $sp+4
+            emit("sw $ra, 0($sp)");       // 保存旧 $ra 在 $sp+0
+            emit("addiu $fp, $sp, 8");    // $fp 指向旧栈顶，局部变量从 $fp-12 开始
+            emit("subu $sp, $sp, 2048");  // 栈帧
+            current_stack_offset = -12;   // 局部变量从 $fp-12 开始（跳过保存区）
 
-            // 处理函数参数 (LLVM IR 中参数也是局部变量)
-            // 你的 IR 中参数会先被 store 到栈上，所以不需要这里特殊处理
-            // 这里只需要重置状态
+            // 处理函数参数: 解析参数列表，将 $a0-$a3 保存到栈上
+            if (paren_start != std::string::npos && paren_end != std::string::npos) {
+                std::string args_str = line.substr(paren_start + 1, paren_end - paren_start - 1);
+                if (!args_str.empty()) {
+                    std::vector<std::string> arg_names;
+                    std::stringstream args_ss(args_str);
+                    std::string arg_part;
+                    while (std::getline(args_ss, arg_part, ',')) {
+                        // 去除前后空白
+                        size_t start = arg_part.find_first_not_of(" \t");
+                        if (start == std::string::npos) continue;
+                        arg_part = arg_part.substr(start);
+                        // 格式: "i32 %arg1" 或 "i32* %arg1"
+                        std::stringstream part_ss(arg_part);
+                        std::string type, name;
+                        part_ss >> type >> name;
+                        if (!name.empty()) {
+                            arg_names.push_back(name);
+                        }
+                    }
+                    // 将参数从 $a0-$a3 保存到栈
+                    const char* arg_regs[] = {"$a0", "$a1", "$a2", "$a3"};
+                    for (size_t i = 0; i < arg_names.size() && i < 4; ++i) {
+                        allocStack(arg_names[i]);
+                        int offset = getStackOffset(arg_names[i]);
+                        emit("sw " + std::string(arg_regs[i]) + ", " + std::to_string(offset) + "($fp) # Save arg " + arg_names[i]);
+                    }
+                }
+            }
         }
         else if (token == "}") {
             in_function = false;
@@ -331,8 +430,7 @@ void MipsGenerator::processInstruction(const std::string& line) {
 
         if (op == "alloca") {
             // %1 = alloca i32
-            // 只需要分配栈空间，不需要生成汇编指令
-            // 如果是数组，解析大小
+            // 分配栈空间，alloca 的结果是该空间的地址
             int size = 4;
             std::string type;
             ss >> type;
@@ -343,15 +441,20 @@ void MipsGenerator::processInstruction(const std::string& line) {
                 size = num * 4;
             }
             allocStack(dest, size);
-            // alloca 的返回值是地址，我们可以把它视为一个存放在寄存器里的值
-            // 其实就是 $fp + offset。
-            // 但为了简单，LLVM 后续会用 gep 计算，这里先不处理
+            // * 标记这个变量是 alloca 出来的，其值是地址
+            is_alloca_var[dest] = true;
         }
         else if (op == "add" || op == "sub" || op == "mul" || op == "sdiv" || op == "srem") {
-            // %3 = add i32 %1, %2
+            // %2 = add nsw i32 %0, %1
+            // 可能有 nsw/nuw 修饰符，需要跳过
             std::string type, s1, s2;
-            ss >> type >> s1 >> s2;
-            if (s1.back() == ',') s1.pop_back();
+            ss >> type;
+            // 跳过 nsw, nuw 等修饰符
+            while (type == "nsw" || type == "nuw") {
+                ss >> type;
+            }
+            ss >> s1 >> s2;
+            if (!s1.empty() && s1.back() == ',') s1.pop_back();
 
             int r1 = getReg(s1, false);
             int r2 = getReg(s2, false);
@@ -374,15 +477,15 @@ void MipsGenerator::processInstruction(const std::string& line) {
             }
         }
         else if (op == "load") {
-            // %4 = load i32, i32* %3
+            // %0 = load i32, i32* %i_2_addr, align 4
+            // 解析格式: load <val_type>, <ptr_type> <ptr>, align <n>
             std::string val_type, ptr_type, ptr;
-            ss >> val_type >> ptr_type >> ptr; // ptr_type 含有逗号
-            ptr = ptr_type; // 容错处理简单的 split
-            // 严谨点应该循环读到最后一个
-            while(ss >> ptr);
+            ss >> val_type >> ptr_type >> ptr;
+            // 去掉 ptr 末尾的逗号（如果有）
+            if (!ptr.empty() && ptr.back() == ',') ptr.pop_back();
 
-            // 指针地址
-            int r_ptr = getReg(ptr, false);
+            // 指针地址 - 使用 is_addr=true，只取地址不取值
+            int r_ptr = getReg(ptr, false, true);
             int r_dest = getReg(dest, true);
             emit("lw " + getRegName(r_dest) + ", 0(" + getRegName(r_ptr) + ")");
         }
@@ -404,54 +507,51 @@ void MipsGenerator::processInstruction(const std::string& line) {
             else if (cond == "sle") emit("sle " + getRegName(rd) + ", " + getRegName(r1) + ", " + getRegName(r2));
         }
         else if (op == "getelementptr") {
-            // %2 = getelementptr inbounds i32, i32* %1, i32 %0
-            // 简化处理：base + offset
-            // 解析出 base 指针 和 最后一个 offset
-            // 这部分逻辑较复杂，简化假设 offset 已经通过 mul 算好了字节数
-            // 但 LLVM 中 gep 的 offset 是元素个数。
-
-            // 假设格式: ... type* %base, ... i32 %offset
-            std::string base, idx;
-            // 简单的解析策略：
+            // %4 = getelementptr inbounds [2 x i8], [2 x i8]* @.str0, i32 0, i32 0
+            // 解析：跳过 inbounds，找到 base 指针和最后一个 offset
             std::vector<std::string> parts;
             std::string temp;
             while (ss >> temp) parts.push_back(temp);
 
-            // parts 通常含有逗号，需要清理
-            for(auto& p : parts) if(p.back()==',') p.pop_back();
-            base = parts[1]; // 假设 parts[0] 是类型，parts[1] 是基址
-            // 如果 parts[1] 不是 % 或 @，可能是类型，继续找
-            int idx_val_pos = -1;
-            for(int i=0; i<parts.size(); i++) {
-                if (parts[i].find('*') != std::string::npos) {
-                    base = parts[i+1]; // 指针类型后的下一个是基址
+            // 清理逗号
+            for(auto& p : parts) if(!p.empty() && p.back()==',') p.pop_back();
+
+            // 找 base（第一个 * 后面的变量）和 idx（最后一个值）
+            std::string base, idx;
+            for(size_t i = 0; i < parts.size(); i++) {
+                if (parts[i].find('*') != std::string::npos && i + 1 < parts.size()) {
+                    base = parts[i + 1];
+                    break;
                 }
             }
-            idx = parts.back(); // 最后一个是偏移
+            idx = parts.back();
 
-            int r_base = getReg(base, false);
-            int r_idx = getReg(idx, false);
             int r_dest = getReg(dest, true);
 
-            // 计算 offset in bytes: idx * 4
-            // 这里占用一个临时寄存器，或者直接利用 r_dest 计算
-            emit("sll " + getRegName(r_dest) + ", " + getRegName(r_idx) + ", 2"); // dest = idx * 4
-            // 如果 base 是全局变量(@a)，需要先 la 加载地址
+            // 如果 base 是全局变量（@ 开头），直接 la 加载地址
             if (base[0] == '@') {
-                int r_temp = findFreeReg();
-                if (r_temp == -1) r_temp = spillReg();
-                emit("la " + getRegName(r_temp) + ", " + base.substr(1));
-                emit("addu " + getRegName(r_dest) + ", " + getRegName(r_dest) + ", " + getRegName(r_temp));
-                regs[r_temp].busy = false; // 释放临时
-            }
-            else if (op == "alloca") {
-                // 如果 base 是 alloca 出来的局部数组首地址
-                // alloca 在 MIPS 里仅仅是栈偏移
-                int offset = getStackOffset(base);
-                emit("addu " + getRegName(r_dest) + ", " + getRegName(r_dest) + ", $fp");
-                emit("addiu " + getRegName(r_dest) + ", " + getRegName(r_dest) + ", " + std::to_string(offset));
+                std::string raw_label = base.substr(1);
+                // 字符串常量以 .str 开头不需要前缀，其他全局变量需要 _ 前缀
+                std::string label = (raw_label[0] == '.') ? raw_label : ("_" + raw_label);
+                // 对于字符串常量或数组，offset 通常是 0，直接 la 即可
+                if (isNumber(idx) && std::stoi(idx) == 0) {
+                    emit("la " + getRegName(r_dest) + ", " + label);
+                } else {
+                    // 非零 offset：计算 base + idx * element_size
+                    int r_idx = getReg(idx, false);
+                    emit("sll " + getRegName(r_dest) + ", " + getRegName(r_idx) + ", 2");
+                    int r_temp = findFreeReg();
+                    if (r_temp == -1) r_temp = spillReg();
+                    emit("la " + getRegName(r_temp) + ", " + label);
+                    emit("addu " + getRegName(r_dest) + ", " + getRegName(r_dest) + ", " + getRegName(r_temp));
+                    regs[r_temp].busy = false;
+                }
             }
             else {
+                // 局部变量指针
+                int r_base = getReg(base, false);
+                int r_idx = getReg(idx, false);
+                emit("sll " + getRegName(r_dest) + ", " + getRegName(r_idx) + ", 2");
                 emit("addu " + getRegName(r_dest) + ", " + getRegName(r_dest) + ", " + getRegName(r_base));
             }
         }
@@ -528,12 +628,15 @@ void MipsGenerator::processInstruction(const std::string& line) {
     }
         // 3. Store 指令
     else if (token == "store") {
+        // store i1 %1, i1* %and_res4, align 1
         std::string type, val, ptr_type, ptr;
-        ss >> type >> val >> ptr_type >> ptr; // ptr_type 含逗号
-        if (val.back() == ',') val.pop_back();
+        ss >> type >> val >> ptr_type >> ptr;
+        // 去掉逗号
+        if (!val.empty() && val.back() == ',') val.pop_back();
+        if (!ptr.empty() && ptr.back() == ',') ptr.pop_back();
 
         int r_val = getReg(val, false);
-        int r_ptr = getReg(ptr, false);
+        int r_ptr = getReg(ptr, false, true);  // is_addr=true，只取地址不取值
 
         emit("sw " + getRegName(r_val) + ", 0(" + getRegName(r_ptr) + ")");
     }
@@ -551,9 +654,11 @@ void MipsGenerator::processInstruction(const std::string& line) {
         }
 
         // Epilogue
-        emit("lw $ra, -8($fp)");
-        emit("lw $fp, -4($fp)");
-        emit("addiu $sp, $sp, 2048");
+        // 栈布局: $fp 指向旧栈顶，$ra 在 $fp-8，$fp 在 $fp-4
+        emit("subu $sp, $fp, 8");   // 恢复 $sp 到保存区
+        emit("lw $ra, 0($sp)");     // 恢复 $ra
+        emit("lw $fp, 4($sp)");     // 恢复 $fp
+        emit("addiu $sp, $sp, 8");  // 释放保存区
         emit("jr $ra");
     }
         // 5. Br 指令
@@ -582,6 +687,51 @@ void MipsGenerator::processInstruction(const std::string& line) {
             emit("lw $t8, " + std::to_string(offset) + "($fp)"); // 使用临时寄存器 $t8
             emit("bne $t8, $zero, " + l1.substr(1));
             emit("j " + l2.substr(1));
+        }
+    }
+    // 6. Void call 指令 (没有返回值的函数调用)
+    else if (token == "call") {
+        // call void @putint(i32 %3)
+        flushRegisters();
+
+        std::string ret_type, func_name;
+        ss >> ret_type >> func_name;
+        size_t p = func_name.find('(');
+        std::string real_name = func_name.substr(1, p-1);
+        std::string args_str = line.substr(line.find('(')+1);
+        if (!args_str.empty() && args_str.back() == ')') args_str.pop_back();
+
+        // 解析参数
+        std::stringstream arg_ss(args_str);
+        std::string segment;
+        int arg_idx = 0;
+        while(std::getline(arg_ss, segment, ',')) {
+            std::stringstream seg_ss(segment);
+            std::string type, val;
+            seg_ss >> type >> val;
+            if (val.empty()) continue;
+
+            int r = getReg(val, false);
+            if (arg_idx < 4) {
+                emit("move $a" + std::to_string(arg_idx) + ", " + getRegName(r));
+            }
+            arg_idx++;
+        }
+
+        if (real_name == "putint") {
+            emit("li $v0, 1");
+            emit("syscall");
+        }
+        else if (real_name == "putstr") {
+            emit("li $v0, 4");
+            emit("syscall");
+        }
+        else if (real_name == "putch") {
+            emit("li $v0, 11");
+            emit("syscall");
+        }
+        else {
+            emit("jal " + real_name);
         }
     }
 }

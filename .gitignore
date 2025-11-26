@@ -1,0 +1,28 @@
+# Build output
+build/
+*.o
+*.out
+compiler
+
+# IDE and editor
+.vscode/
+.idea/
+.history/
+*.swp
+*.swo
+*~
+
+# Temporary files
+.cache/
+*.tmp
+
+# Screenshots
+screenshots/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Preprocessed/intermediate files
+*.i
+*.ll
+*.s

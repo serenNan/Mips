@@ -23,6 +23,7 @@ private:
 
     // 栈管理
     std::map<std::string, int> stack_map;
+    std::map<std::string, bool> is_alloca_var; // 标记哪些变量是 alloca 出来的（值是地址）
     int current_stack_offset;
 
     // 寄存器管理 ($t0 - $t9, 对应索引 0 - 9)
