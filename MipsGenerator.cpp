@@ -81,6 +81,55 @@ bool MipsGenerator::isNumber(const std::string& s) {
     return true;
 }
 
+// * 判断是否为临时变量（%0, %1 等数字开头的变量）
+static bool isTempVar(const std::string& name) {
+    if (name.empty() || name[0] != '%') return false;
+    if (name.length() < 2) return false;
+    return isdigit(name[1]);
+}
+
+// * 检查立即数是否在 16 位有符号范围内（可用于 addiu, ori 等）
+bool MipsGenerator::isSmallImmediate(int val) {
+    return val >= -32768 && val <= 32767;
+}
+
+// * 预分析函数，统计变量使用次数（用于死代码消除）
+void MipsGenerator::preAnalyzeFunction(const std::vector<std::string>& instructions) {
+    var_use_count.clear();
+    for (const auto& line : instructions) {
+        std::stringstream ss(line);
+        std::string token;
+        ss >> token;
+
+        // 统计所有 % 开头的变量使用
+        std::string rest = line;
+        size_t pos = 0;
+        while ((pos = rest.find('%', pos)) != std::string::npos) {
+            size_t end = pos + 1;
+            while (end < rest.size() && (isalnum(rest[end]) || rest[end] == '_' || rest[end] == '.')) {
+                end++;
+            }
+            std::string var = rest.substr(pos, end - pos);
+            if (!var.empty() && var != "%") {
+                var_use_count[var]++;
+            }
+            pos = end;
+        }
+    }
+
+    // 定义的变量减去一次（因为定义本身不算使用）
+    for (const auto& line : instructions) {
+        if (line.find(" = ") != std::string::npos) {
+            std::stringstream ss(line);
+            std::string dest;
+            ss >> dest;
+            if (dest[0] == '%') {
+                var_use_count[dest]--;
+            }
+        }
+    }
+}
+
 std::string MipsGenerator::getRegName(int index) {
     return "$t" + std::to_string(index);
 }
@@ -155,10 +204,16 @@ int MipsGenerator::getReg(const std::string& var_name, bool is_def, bool is_addr
     // 我们分配一个临时寄存器装载它，通常不记录在 var_in_reg 中，用完即扔（或者可以优化）
     // 为了简化 LRU 逻辑，这里我们也将其视为普通变量，但名字要是唯一的（防止冲突）
     if (isNumber(var_name)) {
+        int val = std::stoi(var_name);
+        // * 优化：0 可以直接使用 $zero 寄存器的值
         int reg = findFreeReg();
         if (reg == -1) reg = spillReg();
 
-        emit("li " + getRegName(reg) + ", " + var_name);
+        if (val == 0) {
+            emit("move " + getRegName(reg) + ", $zero");
+        } else {
+            emit("li " + getRegName(reg) + ", " + var_name);
+        }
         // 数字不占用 var_in_reg 映射，只是临时占用寄存器
         regs[reg].busy = true;
         regs[reg].name = ""; // 匿名
@@ -215,7 +270,9 @@ int MipsGenerator::getReg(const std::string& var_name, bool is_def, bool is_addr
             regs[reg].dirty = false;
         }
     } else {
-        regs[reg].dirty = true; // 定义操作，初始就是脏的
+        // 定义操作，标记为 dirty
+        // ! 不能用单次使用优化，因为 flush 会导致问题
+        regs[reg].dirty = true;
     }
     return reg;
 }
@@ -421,7 +478,9 @@ void MipsGenerator::parseGlobalVars() {
 
 void MipsGenerator::parseFunctions() {
     std::string line;
+    std::vector<std::string> func_lines; // * 缓存当前函数的所有指令
     bool in_function = false;
+    std::string current_func_header;
 
     while (std::getline(llvm_file, line)) {
         if (line.empty()) continue;
@@ -431,66 +490,79 @@ void MipsGenerator::parseFunctions() {
 
         if (token == "define") {
             in_function = true;
-            flushRegisters(); // 安全起见
-            stack_map.clear();
-            is_alloca_var.clear(); // 清空 alloca 标记
-            current_stack_offset = 0;
-
-            // 从完整的 line 解析函数定义
-            // 格式: define i32 @func2(i32 %arg1, i32 %arg2) {
-            size_t at_pos = line.find('@');
-            size_t paren_start = line.find('(');
-            size_t paren_end = line.find(')');
-
-            std::string func_name = line.substr(at_pos + 1, paren_start - at_pos - 1);
-
-            mips_file << "\n" << func_name << ":\n";
-            // Prologue
-            // 栈布局: $sp(原) -> [$fp saved], [$ra saved], [locals...]
-            // 先减 $sp 为保存区腾出空间
-            emit("subu $sp, $sp, 8");     // 为 $fp 和 $ra 预留空间
-            emit("sw $fp, 4($sp)");       // 保存旧 $fp 在 $sp+4
-            emit("sw $ra, 0($sp)");       // 保存旧 $ra 在 $sp+0
-            emit("addiu $fp, $sp, 8");    // $fp 指向旧栈顶，局部变量从 $fp-12 开始
-            emit("subu $sp, $sp, 2048");  // 栈帧 (小型栈帧)
-            current_stack_offset = -12;   // 局部变量从 $fp-12 开始（跳过保存区）
-
-            // 处理函数参数: 解析参数列表，将 $a0-$a3 保存到栈上
-            if (paren_start != std::string::npos && paren_end != std::string::npos) {
-                std::string args_str = line.substr(paren_start + 1, paren_end - paren_start - 1);
-                if (!args_str.empty()) {
-                    std::vector<std::string> arg_names;
-                    std::stringstream args_ss(args_str);
-                    std::string arg_part;
-                    while (std::getline(args_ss, arg_part, ',')) {
-                        // 去除前后空白
-                        size_t start = arg_part.find_first_not_of(" \t");
-                        if (start == std::string::npos) continue;
-                        arg_part = arg_part.substr(start);
-                        // 格式: "i32 %arg1" 或 "i32* %arg1"
-                        std::stringstream part_ss(arg_part);
-                        std::string type, name;
-                        part_ss >> type >> name;
-                        if (!name.empty()) {
-                            arg_names.push_back(name);
-                        }
-                    }
-                    // 将参数从 $a0-$a3 保存到栈
-                    const char* arg_regs[] = {"$a0", "$a1", "$a2", "$a3"};
-                    for (size_t i = 0; i < arg_names.size() && i < 4; ++i) {
-                        allocStack(arg_names[i]);
-                        int offset = getStackOffset(arg_names[i]);
-                        emitStoreWord(std::string(arg_regs[i]), offset, "$fp");
-                        emit("# Save arg " + arg_names[i]);
-                    }
-                }
-            }
+            current_func_header = line;
+            func_lines.clear();
         }
         else if (token == "}") {
-            in_function = false;
+            if (in_function) {
+                // * 预分析函数内所有指令
+                preAnalyzeFunction(func_lines);
+
+                flushRegisters(); // 安全起见
+                stack_map.clear();
+                is_alloca_var.clear(); // 清空 alloca 标记
+                current_stack_offset = 0;
+
+                // 从完整的 line 解析函数定义
+                // 格式: define i32 @func2(i32 %arg1, i32 %arg2) {
+                size_t at_pos = current_func_header.find('@');
+                size_t paren_start = current_func_header.find('(');
+                size_t paren_end = current_func_header.find(')');
+
+                std::string func_name = current_func_header.substr(at_pos + 1, paren_start - at_pos - 1);
+
+                mips_file << "\n" << func_name << ":\n";
+                // Prologue
+                // 栈布局: $sp(原) -> [$fp saved], [$ra saved], [locals...]
+                // 先减 $sp 为保存区腾出空间
+                emit("subu $sp, $sp, 8");     // 为 $fp 和 $ra 预留空间
+                emit("sw $fp, 4($sp)");       // 保存旧 $fp 在 $sp+4
+                emit("sw $ra, 0($sp)");       // 保存旧 $ra 在 $sp+0
+                emit("addiu $fp, $sp, 8");    // $fp 指向旧栈顶，局部变量从 $fp-12 开始
+                emit("subu $sp, $sp, 2048");  // 栈帧 (小型栈帧)
+                current_stack_offset = -12;   // 局部变量从 $fp-12 开始（跳过保存区）
+
+                // 处理函数参数: 解析参数列表，将 $a0-$a3 保存到栈上
+                if (paren_start != std::string::npos && paren_end != std::string::npos) {
+                    std::string args_str = current_func_header.substr(paren_start + 1, paren_end - paren_start - 1);
+                    if (!args_str.empty()) {
+                        std::vector<std::string> arg_names;
+                        std::stringstream args_ss(args_str);
+                        std::string arg_part;
+                        while (std::getline(args_ss, arg_part, ',')) {
+                            // 去除前后空白
+                            size_t start = arg_part.find_first_not_of(" \t");
+                            if (start == std::string::npos) continue;
+                            arg_part = arg_part.substr(start);
+                            // 格式: "i32 %arg1" 或 "i32* %arg1"
+                            std::stringstream part_ss(arg_part);
+                            std::string type, name;
+                            part_ss >> type >> name;
+                            if (!name.empty()) {
+                                arg_names.push_back(name);
+                            }
+                        }
+                        // 将参数从 $a0-$a3 保存到栈
+                        const char* arg_regs[] = {"$a0", "$a1", "$a2", "$a3"};
+                        for (size_t i = 0; i < arg_names.size() && i < 4; ++i) {
+                            allocStack(arg_names[i]);
+                            int offset = getStackOffset(arg_names[i]);
+                            emitStoreWord(std::string(arg_regs[i]), offset, "$fp");
+                            emit("# Save arg " + arg_names[i]);
+                        }
+                    }
+                }
+
+                // * 处理函数体的所有指令
+                for (const auto& instr : func_lines) {
+                    processInstruction(instr);
+                }
+
+                in_function = false;
+            }
         }
         else if (in_function) {
-            processInstruction(line);
+            func_lines.push_back(line);
         }
     }
 }
@@ -547,24 +619,80 @@ void MipsGenerator::processInstruction(const std::string& line) {
             ss >> s1 >> s2;
             if (!s1.empty() && s1.back() == ',') s1.pop_back();
 
-            int r1 = getReg(s1, false);
-            int r2 = getReg(s2, false);
-            int rd = getReg(dest, true); // dest 是定义
+            bool handled = false;
 
-            std::string mips_op = "addu";
-            if (op == "sub") mips_op = "subu";
-            else if (op == "mul") mips_op = "mul";
-            else if (op == "sdiv") mips_op = "div";
-            else if (op == "srem") mips_op = "div"; // 取余也要 div
+            // * 优化：sub 0, X 可以用 negu（取负）
+            if (op == "sub" && isNumber(s1) && std::stoi(s1) == 0) {
+                int r2 = getReg(s2, false);
+                int rd = getReg(dest, true);
+                emit("negu " + getRegName(rd) + ", " + getRegName(r2));
+                handled = true;
+            }
+            // * 优化：立即数形式指令
+            // add/sub 可以使用 addiu/subiu（MIPS 没有 subiu，用 addiu 负数）
+            if (!handled && op == "add" && isNumber(s2)) {
+                int imm = std::stoi(s2);
+                if (isSmallImmediate(imm)) {
+                    int r1 = getReg(s1, false);
+                    int rd = getReg(dest, true);
+                    emit("addiu " + getRegName(rd) + ", " + getRegName(r1) + ", " + s2);
+                    handled = true;
+                }
+            }
+            if (!handled && op == "sub" && isNumber(s2)) {
+                int imm = std::stoi(s2);
+                if (isSmallImmediate(-imm)) {
+                    int r1 = getReg(s1, false);
+                    int rd = getReg(dest, true);
+                    emit("addiu " + getRegName(rd) + ", " + getRegName(r1) + ", " + std::to_string(-imm));
+                    handled = true;
+                }
+            }
+            // * 优化：乘以 2 的幂次可以用移位
+            if (!handled && op == "mul" && isNumber(s2)) {
+                int imm = std::stoi(s2);
+                if (imm > 0 && (imm & (imm - 1)) == 0) { // 是 2 的幂
+                    int shift = 0;
+                    while ((1 << shift) < imm) shift++;
+                    int r1 = getReg(s1, false);
+                    int rd = getReg(dest, true);
+                    emit("sll " + getRegName(rd) + ", " + getRegName(r1) + ", " + std::to_string(shift));
+                    handled = true;
+                }
+            }
+            // * 优化：除以 2 的幂次可以用移位（仅正数安全）
+            if (!handled && op == "sdiv" && isNumber(s2)) {
+                int imm = std::stoi(s2);
+                if (imm > 0 && (imm & (imm - 1)) == 0) { // 是 2 的幂
+                    int shift = 0;
+                    while ((1 << shift) < imm) shift++;
+                    int r1 = getReg(s1, false);
+                    int rd = getReg(dest, true);
+                    emit("sra " + getRegName(rd) + ", " + getRegName(r1) + ", " + std::to_string(shift));
+                    handled = true;
+                }
+            }
 
-            if (op == "sdiv") {
-                emit("div " + getRegName(r1) + ", " + getRegName(r2));
-                emit("mflo " + getRegName(rd));
-            } else if (op == "srem") {
-                emit("div " + getRegName(r1) + ", " + getRegName(r2));
-                emit("mfhi " + getRegName(rd));
-            } else {
-                emit(mips_op + " " + getRegName(rd) + ", " + getRegName(r1) + ", " + getRegName(r2));
+            if (!handled) {
+                int r1 = getReg(s1, false);
+                int r2 = getReg(s2, false);
+                int rd = getReg(dest, true); // dest 是定义
+
+                std::string mips_op = "addu";
+                if (op == "sub") mips_op = "subu";
+                else if (op == "mul") mips_op = "mul";
+                else if (op == "sdiv") mips_op = "div";
+                else if (op == "srem") mips_op = "div"; // 取余也要 div
+
+                if (op == "sdiv") {
+                    emit("div " + getRegName(r1) + ", " + getRegName(r2));
+                    emit("mflo " + getRegName(rd));
+                } else if (op == "srem") {
+                    emit("div " + getRegName(r1) + ", " + getRegName(r2));
+                    emit("mfhi " + getRegName(rd));
+                } else {
+                    emit(mips_op + " " + getRegName(rd) + ", " + getRegName(r1) + ", " + getRegName(r2));
+                }
             }
         }
         else if (op == "load") {
@@ -586,16 +714,32 @@ void MipsGenerator::processInstruction(const std::string& line) {
             ss >> cond >> type >> s1 >> s2;
             if (s1.back() == ',') s1.pop_back();
 
+            // * 优化：与 0 比较时使用 $zero 寄存器
+            bool s2_is_zero = (isNumber(s2) && std::stoi(s2) == 0);
+
             int r1 = getReg(s1, false);
-            int r2 = getReg(s2, false);
             int rd = getReg(dest, true);
 
-            if (cond == "eq") emit("seq " + getRegName(rd) + ", " + getRegName(r1) + ", " + getRegName(r2));
-            else if (cond == "ne") emit("sne " + getRegName(rd) + ", " + getRegName(r1) + ", " + getRegName(r2));
-            else if (cond == "sgt") emit("sgt " + getRegName(rd) + ", " + getRegName(r1) + ", " + getRegName(r2));
-            else if (cond == "sge") emit("sge " + getRegName(rd) + ", " + getRegName(r1) + ", " + getRegName(r2));
-            else if (cond == "slt") emit("slt " + getRegName(rd) + ", " + getRegName(r1) + ", " + getRegName(r2));
-            else if (cond == "sle") emit("sle " + getRegName(rd) + ", " + getRegName(r1) + ", " + getRegName(r2));
+            if (s2_is_zero) {
+                // * 与 0 比较，可以用 $zero 寄存器
+                if (cond == "eq") emit("seq " + getRegName(rd) + ", " + getRegName(r1) + ", $zero");
+                else if (cond == "ne") emit("sne " + getRegName(rd) + ", " + getRegName(r1) + ", $zero");
+                else if (cond == "sgt") emit("sgt " + getRegName(rd) + ", " + getRegName(r1) + ", $zero");
+                else if (cond == "sge") emit("sge " + getRegName(rd) + ", " + getRegName(r1) + ", $zero");
+                else if (cond == "slt") emit("slt " + getRegName(rd) + ", " + getRegName(r1) + ", $zero");
+                else if (cond == "sle") emit("sle " + getRegName(rd) + ", " + getRegName(r1) + ", $zero");
+            } else if (cond == "slt" && isNumber(s2) && isSmallImmediate(std::stoi(s2))) {
+                // * 优化：slt 与立即数比较可以用 slti
+                emit("slti " + getRegName(rd) + ", " + getRegName(r1) + ", " + s2);
+            } else {
+                int r2 = getReg(s2, false);
+                if (cond == "eq") emit("seq " + getRegName(rd) + ", " + getRegName(r1) + ", " + getRegName(r2));
+                else if (cond == "ne") emit("sne " + getRegName(rd) + ", " + getRegName(r1) + ", " + getRegName(r2));
+                else if (cond == "sgt") emit("sgt " + getRegName(rd) + ", " + getRegName(r1) + ", " + getRegName(r2));
+                else if (cond == "sge") emit("sge " + getRegName(rd) + ", " + getRegName(r1) + ", " + getRegName(r2));
+                else if (cond == "slt") emit("slt " + getRegName(rd) + ", " + getRegName(r1) + ", " + getRegName(r2));
+                else if (cond == "sle") emit("sle " + getRegName(rd) + ", " + getRegName(r1) + ", " + getRegName(r2));
+            }
         }
         else if (op == "getelementptr") {
             // %4 = getelementptr inbounds [2 x i8], [2 x i8]* @.str0, i32 0, i32 0
@@ -653,7 +797,10 @@ void MipsGenerator::processInstruction(const std::string& line) {
             ss >> type1 >> s1 >> to >> type2;
             int r_src = getReg(s1, false);
             int r_dst = getReg(dest, true);
-            emit("move " + getRegName(r_dst) + ", " + getRegName(r_src));
+            // * 优化：源和目标相同时省略 move
+            if (r_src != r_dst) {
+                emit("move " + getRegName(r_dst) + ", " + getRegName(r_src));
+            }
         }
         else if (op == "call") {
             // %3 = call i32 @func(...)
@@ -733,16 +880,34 @@ void MipsGenerator::processInstruction(const std::string& line) {
     }
         // 4. Ret 指令
     else if (token == "ret") {
-        flushRegisters(); // 返回前必须写回，虽然栈帧即将销毁，但如果是 void 函数可能有副作用
+        // * 优化：ret 前不需要 flush 局部变量，因为栈帧即将销毁
+        // 但需要先获取返回值（如果有）
         std::string type, val;
         ss >> type;
         if (type != "void") {
             ss >> val;
-            // 加载返回值到 $v0
-            // 这里不能用 getReg，因为我们马上要退出了，直接 lw 或者 li
-            int r_val = getReg(val, false);
-            emit("move $v0, " + getRegName(r_val));
+            // * 优化：如果返回值是立即数，直接 li $v0
+            if (isNumber(val)) {
+                int imm = std::stoi(val);
+                if (imm == 0) {
+                    emit("move $v0, $zero");
+                } else {
+                    emit("li $v0, " + val);
+                }
+            } else {
+                // 加载返回值到 $v0
+                int r_val = getReg(val, false);
+                emit("move $v0, " + getRegName(r_val));
+            }
         }
+        // 不需要 flushRegisters()，栈帧即将销毁
+        // 清空寄存器状态即可
+        for (int i = 0; i < 10; ++i) {
+            regs[i].busy = false;
+            regs[i].dirty = false;
+            regs[i].name = "";
+        }
+        var_in_reg.clear();
 
         // Epilogue
         // 栈布局: $fp 指向旧栈顶，$ra 在 $fp-8，$fp 在 $fp-4
@@ -754,11 +919,11 @@ void MipsGenerator::processInstruction(const std::string& line) {
     }
         // 5. Br 指令
     else if (token == "br") {
-        flushRegisters(); // 跳转前必须写回
         std::string label_or_cond;
         ss >> label_or_cond;
 
         if (label_or_cond == "label") {
+            flushRegisters(); // 无条件跳转前写回
             std::string label;
             ss >> label; // %label1
             emit("j " + label.substr(1));
@@ -773,10 +938,14 @@ void MipsGenerator::processInstruction(const std::string& line) {
             ss >> l1_kw >> l1 >> l2_kw >> l2; // label %true, label %false
             if(l1.back()==',') l1.pop_back();
 
-            // 加载条件变量。由于我们已经 flush 了，这里只能手动 lw
-            int offset = getStackOffset(val_name);
-            emitLoadWord("$t8", offset, "$fp"); // 使用临时寄存器 $t8
-            emit("bne $t8, $zero, " + l1.substr(1));
+            // * 优化：先获取条件变量到寄存器，保存寄存器名后再 flush
+            int r_cond = getReg(val_name, false);
+            std::string cond_reg = getRegName(r_cond);
+            // 标记这个寄存器不需要 flush（即将用于 bne）
+            regs[r_cond].dirty = false;
+            flushRegisters(); // 跳转前写回（不会写回条件寄存器）
+            // * 优化：直接使用条件寄存器，不需要额外 move
+            emit("bne " + cond_reg + ", $zero, " + l1.substr(1));
             emit("j " + l2.substr(1));
         }
     }
