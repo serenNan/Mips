@@ -7,9 +7,9 @@ test_case() {
     ./compiler 2>&1 > /dev/null
 
     if [ -f "$dir/in.txt" ]; then
-        result=$(cat "$dir/in.txt" | timeout 10 spim -file mips.txt 2>&1 | tail -n +6)
+        result=$(cat "$dir/in.txt" | timeout 10 spim -lstack 10000000 -file mips.txt 2>&1 | tail -n +6)
     else
-        result=$(echo "" | timeout 10 spim -file mips.txt 2>&1 | tail -n +6)
+        result=$(echo "" | timeout 10 spim -lstack 10000000 -file mips.txt 2>&1 | tail -n +6)
     fi
 
     expected=$(cat "$dir/ans.txt")

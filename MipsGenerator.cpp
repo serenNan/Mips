@@ -31,6 +31,46 @@ void MipsGenerator::emit(const std::string& asm_code) {
     mips_file << "    " << asm_code << "\n";
 }
 
+// 检查偏移是否在 16 位有符号立即数范围内
+static bool isSmallOffset(int offset) {
+    return offset >= -32768 && offset <= 32767;
+}
+
+// 生成 lw 指令，处理大偏移
+void MipsGenerator::emitLoadWord(const std::string& dest_reg, int offset, const std::string& base_reg) {
+    if (isSmallOffset(offset)) {
+        emit("lw " + dest_reg + ", " + std::to_string(offset) + "(" + base_reg + ")");
+    } else {
+        // 大偏移：使用 $v1 作为临时寄存器 (不使用 $at，因为 SPIM 保留)
+        emit("li $v1, " + std::to_string(offset));
+        emit("addu $v1, " + base_reg + ", $v1");
+        emit("lw " + dest_reg + ", 0($v1)");
+    }
+}
+
+// 生成 sw 指令，处理大偏移
+void MipsGenerator::emitStoreWord(const std::string& src_reg, int offset, const std::string& base_reg) {
+    if (isSmallOffset(offset)) {
+        emit("sw " + src_reg + ", " + std::to_string(offset) + "(" + base_reg + ")");
+    } else {
+        // 大偏移：使用 $v1 作为临时寄存器 (不使用 $at，因为 SPIM 保留)
+        emit("li $v1, " + std::to_string(offset));
+        emit("addu $v1, " + base_reg + ", $v1");
+        emit("sw " + src_reg + ", 0($v1)");
+    }
+}
+
+// 生成地址加载指令 (addiu)，处理大偏移
+void MipsGenerator::emitLoadAddress(const std::string& dest_reg, int offset, const std::string& base_reg) {
+    if (isSmallOffset(offset)) {
+        emit("addiu " + dest_reg + ", " + base_reg + ", " + std::to_string(offset));
+    } else {
+        // 大偏移：使用 li + addu
+        emit("li " + dest_reg + ", " + std::to_string(offset));
+        emit("addu " + dest_reg + ", " + base_reg + ", " + dest_reg);
+    }
+}
+
 bool MipsGenerator::isNumber(const std::string& s) {
     if (s.empty()) return false;
     size_t start = 0;
@@ -85,7 +125,8 @@ int MipsGenerator::spillReg() {
     // * alloca 变量不需要溢出（它的值是地址，是常量）
     if (regs[victim].dirty && !(is_alloca_var.count(var) && is_alloca_var[var])) {
         int offset = getStackOffset(var);
-        emit("sw " + getRegName(victim) + ", " + std::to_string(offset) + "($fp) # Spill " + var);
+        emitStoreWord(getRegName(victim), offset, "$fp");
+        emit("# Spill " + var);
     }
 
     // 清理状态
@@ -163,12 +204,14 @@ int MipsGenerator::getReg(const std::string& var_name, bool is_def, bool is_addr
         } else if (is_alloca_var.count(var_name) && is_alloca_var[var_name]) {
             // * alloca 变量：其值是地址，计算 $fp + offset
             int offset = getStackOffset(var_name);
-            emit("addiu " + getRegName(reg) + ", $fp, " + std::to_string(offset) + " # Address of " + var_name);
+            emitLoadAddress(getRegName(reg), offset, "$fp");
+            emit("# Address of " + var_name);
             regs[reg].dirty = false;
         } else {
             // 普通局部变量/临时变量: 从栈加载值
             int offset = getStackOffset(var_name);
-            emit("lw " + getRegName(reg) + ", " + std::to_string(offset) + "($fp) # Load " + var_name);
+            emitLoadWord(getRegName(reg), offset, "$fp");
+            emit("# Load " + var_name);
             regs[reg].dirty = false;
         }
     } else {
@@ -185,7 +228,8 @@ void MipsGenerator::flushRegisters() {
             if (regs[i].dirty && !regs[i].name.empty() &&
                 !(is_alloca_var.count(regs[i].name) && is_alloca_var[regs[i].name])) {
                 int offset = getStackOffset(regs[i].name);
-                emit("sw " + getRegName(i) + ", " + std::to_string(offset) + "($fp) # Flush " + regs[i].name);
+                emitStoreWord(getRegName(i), offset, "$fp");
+                emit("# Flush " + regs[i].name);
             }
             regs[i].busy = false;
             regs[i].dirty = false;
@@ -236,9 +280,55 @@ void MipsGenerator::parseGlobalVars() {
                 } else {
                     mips_file << ".word 0\n";
                 }
+            } else if (line.find("] [") != std::string::npos) {
+                // * 带初始化列表的数组: @arr = global [N x i32] [i32 10, i32 25, ...], align 4
+                size_t init_start = line.find("] [");
+                if (init_start != std::string::npos) {
+                    init_start += 3; // 跳过 "] ["
+                    size_t init_end = line.find("]", init_start);
+                    std::string init_list = line.substr(init_start, init_end - init_start);
+
+                    // 解析 i32 N, i32 M, ...
+                    std::vector<int> values;
+                    std::stringstream init_ss(init_list);
+                    std::string token;
+                    while (std::getline(init_ss, token, ',')) {
+                        size_t i32_pos = token.find("i32");
+                        if (i32_pos != std::string::npos) {
+                            std::string num_str = token.substr(i32_pos + 3);
+                            // 去除空格
+                            num_str.erase(0, num_str.find_first_not_of(" \t"));
+                            num_str.erase(num_str.find_last_not_of(" \t") + 1);
+                            if (!num_str.empty()) {
+                                values.push_back(std::stoi(num_str));
+                            }
+                        }
+                    }
+
+                    // 输出数组值 (SPIM 用逗号分隔)
+                    mips_file << ".word ";
+                    for (size_t i = 0; i < values.size(); ++i) {
+                        if (i > 0) mips_file << ", ";
+                        mips_file << values[i];
+                    }
+                    mips_file << "\n";
+                }
             } else {
-                // 简单标量初始化
-                mips_file << ".word 0\n";
+                // * 简单标量初始化: @c = global i32 3, align 4
+                // 解析 "global i32 <value>" 中的 value
+                size_t i32_pos = line.find("i32 ");
+                if (i32_pos != std::string::npos) {
+                    std::string rest = line.substr(i32_pos + 4);
+                    // 提取数字直到逗号或空格
+                    size_t end = rest.find_first_of(", ");
+                    std::string value_str = rest.substr(0, end);
+                    // 去除前后空格
+                    value_str.erase(0, value_str.find_first_not_of(" \t"));
+                    value_str.erase(value_str.find_last_not_of(" \t") + 1);
+                    mips_file << ".word " << value_str << "\n";
+                } else {
+                    mips_file << ".word 0\n";
+                }
             }
         }
         // * 处理常量数组: @ia1_9 = constant [5 x i32] [i32 1, i32 2, ...], align 4
@@ -275,9 +365,9 @@ void MipsGenerator::parseGlobalVars() {
                     }
                 }
 
-                // 输出数组值 (SPIM 用空格分隔，不是逗号)
+                // 输出数组值 (SPIM 用逗号分隔)
                 for (size_t i = 0; i < values.size(); ++i) {
-                    if (i > 0) mips_file << " ";
+                    if (i > 0) mips_file << ", ";
                     mips_file << values[i];
                 }
                 mips_file << "\n";
@@ -362,7 +452,7 @@ void MipsGenerator::parseFunctions() {
             emit("sw $fp, 4($sp)");       // 保存旧 $fp 在 $sp+4
             emit("sw $ra, 0($sp)");       // 保存旧 $ra 在 $sp+0
             emit("addiu $fp, $sp, 8");    // $fp 指向旧栈顶，局部变量从 $fp-12 开始
-            emit("subu $sp, $sp, 2048");  // 栈帧
+            emit("subu $sp, $sp, 2048");  // 栈帧 (小型栈帧)
             current_stack_offset = -12;   // 局部变量从 $fp-12 开始（跳过保存区）
 
             // 处理函数参数: 解析参数列表，将 $a0-$a3 保存到栈上
@@ -390,7 +480,8 @@ void MipsGenerator::parseFunctions() {
                     for (size_t i = 0; i < arg_names.size() && i < 4; ++i) {
                         allocStack(arg_names[i]);
                         int offset = getStackOffset(arg_names[i]);
-                        emit("sw " + std::string(arg_regs[i]) + ", " + std::to_string(offset) + "($fp) # Save arg " + arg_names[i]);
+                        emitStoreWord(std::string(arg_regs[i]), offset, "$fp");
+                        emit("# Save arg " + arg_names[i]);
                     }
                 }
             }
@@ -684,7 +775,7 @@ void MipsGenerator::processInstruction(const std::string& line) {
 
             // 加载条件变量。由于我们已经 flush 了，这里只能手动 lw
             int offset = getStackOffset(val_name);
-            emit("lw $t8, " + std::to_string(offset) + "($fp)"); // 使用临时寄存器 $t8
+            emitLoadWord("$t8", offset, "$fp"); // 使用临时寄存器 $t8
             emit("bne $t8, $zero, " + l1.substr(1));
             emit("j " + l2.substr(1));
         }

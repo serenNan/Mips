@@ -51,6 +51,11 @@ private:
     bool isNumber(const std::string& s);
     void emit(const std::string& asm_code);
 
+    // 大偏移处理辅助函数
+    void emitLoadWord(const std::string& dest_reg, int offset, const std::string& base_reg);
+    void emitStoreWord(const std::string& src_reg, int offset, const std::string& base_reg);
+    void emitLoadAddress(const std::string& dest_reg, int offset, const std::string& base_reg);
+
 public:
     MipsGenerator(const std::string& llvm_path, const std::string& mips_path);
     ~MipsGenerator();
